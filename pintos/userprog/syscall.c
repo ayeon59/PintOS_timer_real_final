@@ -32,7 +32,8 @@ int sys_write (int fd, const void *buffer, unsigned size);
 int sys_filesize (int fd);
 pid_t sys_fork(const char *thread_name); 
 int sys_wait(pid_t pid);
-
+void sys_seek (int fd, unsigned position);
+unsigned sys_tell (int fd);
 
 /* System call.
  *
@@ -131,10 +132,10 @@ syscall_handler (struct intr_frame *f UNUSED) {
         f->R.rax = sys_write(f->R.rdi, f->R.rsi, f->R.rdx);
         break;
     case SYS_SEEK:
-        // seek(f->R.rdi, f->R.rsi);
+        sys_seek(f->R.rdi, f->R.rsi);
         break;
     case SYS_TELL:
-        // f->R.rax = tell(f->R.rdi);
+        f->R.rax = sys_tell(f->R.rdi);
         break;
     case SYS_CLOSE:
         sys_close(f->R.rdi);
@@ -377,3 +378,31 @@ sys_open (const char *user_fname) {
 
 
   }
+void
+sys_seek (int fd, unsigned position) {
+  /* 표준 입출력은 의미 없는 seek이므로 무시 */
+  if (fd < 2 || fd >= FD_MAX) return;
+
+  struct thread *t = thread_current();
+  struct file *fp = t->fd_table[fd];
+  if (fp == NULL) return;
+
+  lock_acquire(&filesys_lock);
+  file_seek(fp, (off_t)position);
+  lock_release(&filesys_lock);
+}
+
+unsigned
+sys_tell (int fd) {
+  if (fd < 2 || fd >= FD_MAX) return (unsigned)-1;
+
+  struct thread *t = thread_current();
+  struct file *fp = t->fd_table[fd];
+  if (fp == NULL) return (unsigned)-1;
+
+  lock_acquire(&filesys_lock);
+  off_t pos = file_tell(fp);
+  lock_release(&filesys_lock);
+
+  return (unsigned)pos;
+}

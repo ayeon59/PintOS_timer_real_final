@@ -119,7 +119,7 @@ struct thread {
 #ifdef USERPROG
   uint64_t *pml4;               /* Page-map level 4 (process page table). */
   int exit_status;              /* Process exit code. */
-
+  struct file *running_file; 
   /* ── File descriptor table (per-process) ───────────────────────── */
   enum { FD_MIN = 2, FD_MAX = 128 };  /* 0/1은 stdin/stdout 예약 */
   struct file *fd_table[FD_MAX];      /* 비어 있으면 NULL */

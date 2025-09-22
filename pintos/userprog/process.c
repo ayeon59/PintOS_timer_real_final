@@ -406,19 +406,22 @@ process_wait (tid_t child_tid UNUSED) {
 }
 
 /* Exit the process. This function is called by thread_exit (). */
-void
-process_exit (void) {
-    struct thread *curr = thread_current();
+void process_exit (void) {
+  struct thread *curr = thread_current();
 
-    /* 부모가 process_wait()에서 기다리고 있을 수 있으니 먼저 wake up 시킨다. */
-    sema_up(&curr->wait_sema);
+  sema_up(&curr->wait_sema);
+  sema_down(&curr->exit_sema);
 
-    /* 부모가 exit_status를 읽고 sema_up(&child->exit_sema) 해줄 때까지 대기 */
-    sema_down(&curr->exit_sema);
+  /* ★ 실행 파일 락 해제 및 닫기 */
+  if (curr->running_file != NULL) {
+    file_allow_write (curr->running_file);
+    file_close (curr->running_file);
+    curr->running_file = NULL;
+  }
 
-    /* 이제 안전하게 프로세스 자원 정리 */
-    process_cleanup ();
+  process_cleanup ();
 }
+
 
 
 /* Free the current process's resources. */
@@ -525,108 +528,104 @@ static bool load_segment (struct file *file, off_t ofs, uint8_t *upage,
 /* 실행할 프로그램의 binary 파일을 메모리에 올리는 역할 */
 static bool
 load (const char *file_name, struct intr_frame *if_) {
-	struct thread *t = thread_current ();
-	struct ELF ehdr;
-	struct file *file = NULL;
-	off_t file_ofs;
-	bool success = false;
-	int i;
+  struct thread *t = thread_current ();
+  struct ELF ehdr;
+  struct file *file = NULL;
+  off_t file_ofs;
+  bool success = false;
+  int i;
 
-	
-	/* Allocate and activate page directory. */
-	t->pml4 = pml4_create ();
-	if (t->pml4 == NULL)
-		goto done;
-	process_activate (thread_current ());
-	
-	/* Open executable file. */
-	file = filesys_open (file_name);
-	if (file == NULL) {
-		goto done;
-	}
+  t->pml4 = pml4_create ();
+  if (t->pml4 == NULL) goto done;
+  process_activate (t);
 
-	/* Read and verify executable header. */
-	if (file_read (file, &ehdr, sizeof ehdr) != sizeof ehdr
-			|| memcmp (ehdr.e_ident, "\177ELF\2\1\1", 7)
-			|| ehdr.e_type != 2
-			|| ehdr.e_machine != 0x3E // amd64
-			|| ehdr.e_version != 1
-			|| ehdr.e_phentsize != sizeof (struct Phdr)
-			|| ehdr.e_phnum > 1024) {
-		goto done;
-	}
+  /* Open executable file. */
+  file = filesys_open (file_name);
+  if (file == NULL) goto done;
 
-	/* Read program headers. */
+  /* ★ 실행 파일 쓰기 금지: 다른 프로세스가 덮어쓰지 못하도록 */
+  t->running_file = file;
+  file_deny_write (t->running_file);
+
+  /* Read and verify executable header. */
+  if (file_read (file, &ehdr, sizeof ehdr) != sizeof ehdr
+      || memcmp (ehdr.e_ident, "\177ELF\2\1\1", 7)
+      || ehdr.e_type != 2
+      || ehdr.e_machine != 0x3E
+      || ehdr.e_version != 1
+      || ehdr.e_phentsize != sizeof (struct Phdr)
+      || ehdr.e_phnum > 1024) {
+    goto done_fail;  // 헤더 불량이면 실패 경로로
+  }
+
+  /* Read program headers. */
 	file_ofs = ehdr.e_phoff;
 	for (i = 0; i < ehdr.e_phnum; i++) {
-		struct Phdr phdr;
+	struct Phdr phdr;
 
-		if (file_ofs < 0 || file_ofs > file_length (file))
-			goto done;
-		file_seek (file, file_ofs);
+	if (file_ofs < 0 || file_ofs > file_length (file))
+		goto done_fail;
+	file_seek (file, file_ofs);
 
-		if (file_read (file, &phdr, sizeof phdr) != sizeof phdr)
-			goto done;
-		file_ofs += sizeof phdr;
-		switch (phdr.p_type) {
-			case PT_NULL:
-			case PT_NOTE:
-			case PT_PHDR:
-			case PT_STACK:
-			default:
-				/* Ignore this segment. */
-				break;
-			case PT_DYNAMIC:
-			case PT_INTERP:
-			case PT_SHLIB:
-				goto done;
-			/* 파일이 제대로 된 ELF인지 검사하는 과정이 동반되며, 세그먼트 단위로 하나씩 메모리로 올리는 작업을 진행 */
-			case PT_LOAD:
-				if (validate_segment (&phdr, file)) {
-					bool writable = (phdr.p_flags & PF_W) != 0;
-					uint64_t file_page = phdr.p_offset & ~PGMASK;
-					uint64_t mem_page = phdr.p_vaddr & ~PGMASK;
-					uint64_t page_offset = phdr.p_vaddr & PGMASK;
-					uint32_t read_bytes, zero_bytes;
-					if (phdr.p_filesz > 0) {
-						/* Normal segment.
-						 * Read initial part from disk and zero the rest. */
-						read_bytes = page_offset + phdr.p_filesz;
-						zero_bytes = (ROUND_UP (page_offset + phdr.p_memsz, PGSIZE)
-								- read_bytes);
-					} else {
-						/* Entirely zero.
-						 * Don't read anything from disk. */
-						read_bytes = 0;
-						zero_bytes = ROUND_UP (page_offset + phdr.p_memsz, PGSIZE);
-					}
-					if (!load_segment (file, file_page, (void *) mem_page,
-								read_bytes, zero_bytes, writable))
-						goto done;
-				}
-				else
-					goto done;
-				break;
-		}
+	if (file_read (file, &phdr, sizeof phdr) != sizeof phdr)
+		goto done_fail;
+	file_ofs += sizeof phdr;
+
+	switch (phdr.p_type) {
+		case PT_NULL: case PT_NOTE: case PT_PHDR: case PT_STACK:
+		break;
+		case PT_DYNAMIC: case PT_INTERP: case PT_SHLIB:
+		goto done_fail;
+		case PT_LOAD:
+		if (validate_segment (&phdr, file)) {
+			bool writable = (phdr.p_flags & PF_W) != 0;      // ★ ROX 핵심
+			uint64_t file_page  = phdr.p_offset & ~PGMASK;
+			uint64_t mem_page   = phdr.p_vaddr  & ~PGMASK;
+			uint64_t page_ofs   = phdr.p_vaddr  &  PGMASK;
+			uint32_t read_bytes, zero_bytes;
+			if (phdr.p_filesz > 0) {
+			read_bytes = page_ofs + phdr.p_filesz;
+			zero_bytes = (ROUND_UP (page_ofs + phdr.p_memsz, PGSIZE) - read_bytes);
+			} else {
+			read_bytes = 0;
+			zero_bytes = ROUND_UP (page_ofs + phdr.p_memsz, PGSIZE);
+			}
+			if (!load_segment (file, file_page, (void *) mem_page,
+							read_bytes, zero_bytes, writable))
+			goto done_fail;
+		} else goto done_fail;
+		break;
+		default:
+		break;
 	}
-	/* 스택 만들기 !! */
-	/* Set up stack. */
-	if (!setup_stack (if_))
-		goto done;
+	}
 
-	/* Start address. */
-	if_->rip = ehdr.e_entry;
 
-	/* TODO: Your code goes here.
-	 * TODO: Implement argument passing (see project2/argument_passing.html). */
 
-	success = true;
 
+  /* ... (프로그램 헤더 루프/세그먼트 로드 동일) ... */
+
+  if (!setup_stack (if_)) goto done_fail;
+  if_->rip = ehdr.e_entry;
+  success = true;
+
+  /* 성공 시: 파일을 닫지 않는다! running_file로 보관해서 deny 유지 */
+  return true;
+
+done_fail:
+  /* 실패 시: deny를 풀 필요는 없지만, running_file로 보관하지 말고 닫고 null 처리 */
+  if (t->running_file) {
+    file_allow_write (t->running_file);
+    file_close (t->running_file);
+    t->running_file = NULL;
+  }
 done:
-	/* We arrive here whether the load is successful or not. */
-	file_close (file);
-	return success;
+  /* 기존 코드엔 file_close(file);가 있었는데,
+     위에서 running_file로 넘겼으니 여기서는 닫지 말아야 함.
+     실패 경로에서만 닫도록 위에서 처리했어. */
+  return success;
 }
+
 
 
 /* Checks whether PHDR describes a valid, loadable segment in
